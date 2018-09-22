@@ -16,8 +16,12 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from utils.metric import get_ner_fmeasure
-from model.seqmodel import SeqModel
+from model.seqmodel_policy import SeqModel
 from utils.data import Data
+from sklearn.metrics import f1_score
+from torch.distributions import Multinomial
+from torch.autograd import Variable
+
 
 try:
     import cPickle as pickle
@@ -52,8 +56,31 @@ def predict_check(pred_variable, gold_variable, mask_variable):
     overlaped = (pred == gold)
     right_token = np.sum(overlaped * mask)
     total_token = mask.sum()
+
     # print("right: %s, total: %s"%(right_token, total_token))
     return right_token, total_token
+
+def predict_check_f1(pred_variable, gold_variable, mask_variable):
+    """
+        input:
+            pred_variable (batch_size, sent_len): pred tag result, in numpy format
+            gold_variable (batch_size, sent_len): gold result variable
+            mask_variable (batch_size, sent_len): mask variable
+    """
+    pred = pred_variable.cpu().data.numpy()
+    gold = gold_variable.cpu().data.numpy()
+    mask = mask_variable.cpu().data.numpy()
+    overlaped = (pred == gold)
+    right_token = np.sum(overlaped * mask)
+    total_token = mask.sum()
+
+    pred = pred * mask
+    gold = gold * mask
+
+    f1 = f1_score(gold, pred)
+
+    # print("right: %s, total: %s"%(right_token, total_token))
+    return right_token, total_token, f1
 
 
 def recover_label(pred_variable, gold_variable, mask_variable, label_alphabet, word_recover):
@@ -309,6 +336,8 @@ def train(data):
         total_loss = 0
         right_token = 0
         whole_token = 0
+
+
         random.shuffle(data.train_Ids)
         ## set model in train model
         model.train()
@@ -333,6 +362,8 @@ def train(data):
             whole_token += whole
             sample_loss += loss.data[0]
             total_loss += loss.data[0]
+
+
             if end%500 == 0:
                 temp_time = time.time()
                 temp_cost = temp_time - temp_start
@@ -355,6 +386,160 @@ def train(data):
         print("Epoch: %s training finished. Time: %.2fs, speed: %.2fst/s,  total loss: %s"%(idx, epoch_cost, train_num/epoch_cost, total_loss))
         print("totalloss:", total_loss)
         if total_loss > 1e8 or str(total_loss) == "nan":
+            print("ERROR: LOSS EXPLOSION (>1e8) ! PLEASE SET PROPER PARAMETERS AND STRUCTURE! EXIT....")
+            exit(1)
+        # continue
+        speed, acc, p, r, f, _,_ = evaluate(data, model, "dev")
+        dev_finish = time.time()
+        dev_cost = dev_finish - epoch_finish
+
+        if data.seg:
+            current_score = f
+            print("Dev: time: %.2fs, speed: %.2fst/s; acc: %.4f, p: %.4f, r: %.4f, f: %.4f"%(dev_cost, speed, acc, p, r, f))
+        else:
+            current_score = acc
+            print("Dev: time: %.2fs speed: %.2fst/s; acc: %.4f"%(dev_cost, speed, acc))
+
+        if current_score > best_dev:
+            if data.seg:
+                print("Exceed previous best f score:", best_dev)
+            else:
+                print("Exceed previous best acc score:", best_dev)
+            model_name = data.model_dir +'.'+ str(idx) + ".model"
+            print("Save current best model in file:", model_name)
+            torch.save(model.state_dict(), model_name)
+            best_dev = current_score
+        # ## decode test
+        speed, acc, p, r, f, _,_ = evaluate(data, model, "test")
+        test_finish = time.time()
+        test_cost = test_finish - dev_finish
+        if data.seg:
+            print("Test: time: %.2fs, speed: %.2fst/s; acc: %.4f, p: %.4f, r: %.4f, f: %.4f"%(test_cost, speed, acc, p, r, f))
+        else:
+            print("Test: time: %.2fs, speed: %.2fst/s; acc: %.4f"%(test_cost, speed, acc))
+        gc.collect()
+
+
+def train_policy_grad(data):
+    print("Training model with PG...")
+    data.show_data_summary()
+    save_data_name = data.model_dir +".dset"
+    data.save(save_data_name)
+    loss_function = nn.NLLLoss()
+
+
+    if data.load_pre:
+        print("Load Model from file: ", data.model_dir)
+        model = SeqModel(data)
+        ## load model need consider if the model trained in GPU and load in CPU, or vice versa
+        # if not gpu:
+        #     model.load_state_dict(torch.load(model_dir))
+        #     # model.load_state_dict(torch.load(model_dir), map_location=lambda storage, loc: storage)
+        #     # model = torch.load(model_dir, map_location=lambda storage, loc: storage)
+        # else:
+        #     model.load_state_dict(torch.load(model_dir))
+        #     # model = torch.load(model_dir)
+        model.load_state_dict(torch.load(data.load_model_dir))
+    else:
+        model = SeqModel(data)
+
+    optimizer = optim.Adam(model.parameters(), lr=data.HP_lr, weight_decay=data.HP_l2)
+
+    best_dev = -10
+    # data.HP_iteration = 1
+    ## start training
+    for idx in range(data.HP_episode):
+        epoch_start = time.time()
+        temp_start = epoch_start
+        print("Epoch: %s/%s" %(idx,data.HP_episode))
+
+
+        instance_count = 0
+        sample_id_base = 0
+        sample_loss_base = 0
+        total_loss_base = 0
+        right_token_base = 0
+        whole_token_base = 0
+        f1_running_base = 0
+        f1_running_samples = []
+
+        report_sample_re = report_base_re = 0
+
+        running_reward = 10
+        random.shuffle(data.train_Ids)
+
+        state = INITIAL_STATE  # Reset environment and record the starting state
+        done = False
+
+
+        model.train()
+        model.zero_grad()
+
+        batch_size = data.HP_batch_size
+        batch_id = 0
+        train_num = len(data.train_Ids)
+        total_batch = train_num//batch_size+1
+        for batch_id in range(total_batch):
+            start = batch_id*batch_size
+            end = (batch_id+1)*batch_size
+            if end >train_num:
+                end = train_num
+            instance = data.train_Ids[start:end]
+            if not instance:
+                continue
+            batch_word, batch_features, batch_wordlen, batch_wordrecover, batch_char, batch_charlen, batch_charrecover, batch_label, mask  = batchify_with_label(instance, data.HP_gpu)
+            instance_count += 1
+
+            #baseline
+            score_base, loss_base, tag_seq_base = model.neg_log_likelihood_loss(batch_word,batch_features, batch_wordlen, batch_char, batch_charlen, batch_charrecover, batch_label, mask)
+            #sample
+            scores_samples, sample_seqs = model.sample()
+            sample_seqs.append(sample_seqs)
+
+            #get scores base
+            right_base, whole_base, f1_base = predict_check_f1(tag_seq_base, batch_label, mask)
+            right_token_base += right_base
+            whole_token_base += whole_base
+            sample_loss_base += loss_base.data[0]
+            total_loss_base += loss_base.data[0]
+            f1_running_base = (f1_running_base + f1_base) / batch_id
+
+            for sample, score in zip(sample_seqs, scores_samples):
+                right, whole, f1 = predict_check_f1(sample, batch_label, mask)
+                f1_running_samples.append(f1)
+                #rewards and advantage
+                reward_sample = Variable(torch.FloatTensor(f1), requires_grad = False)
+                reward_base = Variable(torch.FloatTensor(f1_base), requires_grad = False)
+                advantage = reward_sample  - reward_base
+                J = score * advantage
+                J.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1)
+                optimizer.step()
+                model.zero_grad()
+
+            if end%500 == 0:
+                temp_time = time.time()
+                temp_cost = temp_time - temp_start
+                temp_start = temp_time
+                print("     Instance: %s; Time: %.2fs; loss: %.4f; acc: %s/%s=%.4f;  f1: %s/%s=%.4f"%(end, temp_cost, sample_loss, right_token_base, whole_token_base,(right_token_base+0.)/whole_token_base), f1_running_base)
+                if sample_loss > 1e8 or str(sample_loss) == "nan":
+                    print("ERROR: LOSS EXPLOSION (>1e8) ! PLEASE SET PROPER PARAMETERS AND STRUCTURE! EXIT....")
+                    exit(1)
+                sys.stdout.flush()
+                sample_loss = 0
+            #loss.backward()
+            #optimizer.step()
+            #model.zero_grad()
+
+        temp_time = time.time()
+        temp_cost = temp_time - temp_start
+        print("  Instance: %s; Time: %.2fs; loss: %.4f; acc: %s/%s=%.4f, f1: %s/%s=%.4f"%(end, temp_cost, sample_loss, right_token_base, whole_token_base,(right_token_base+0.)/whole_token_base), f1_running_base)
+
+        epoch_finish = time.time()
+        epoch_cost = epoch_finish - epoch_start
+        print("Epoch: %s training finished. Time: %.2fs, speed: %.2fst/s,  total loss: %s"%(idx, epoch_cost, train_num/epoch_cost, total_loss_base))
+        print("totalloss:", total_loss_base)
+        if total_loss_base > 1e8 or str(total_loss_base) == "nan":
             print("ERROR: LOSS EXPLOSION (>1e8) ! PLEASE SET PROPER PARAMETERS AND STRUCTURE! EXIT....")
             exit(1)
         # continue
